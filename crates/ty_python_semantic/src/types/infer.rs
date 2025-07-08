@@ -1620,11 +1620,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // this does *not* need to be a binding. It could be just `x: int`.
                     nonlocal_use_def_map = self.index.use_def_map(enclosing_scope_file_id);
                     break nonlocal_use_def_map.end_of_scope_declarations(enclosing_place_id);
-                } else {
-                    // This case is a syntax error (no binding for `nonlocal` found) but ignore
-                    // that here.
-                    break use_def.declarations_at_binding(binding);
                 }
+
+                // We ran out of ancestor scopes without finding a definition. This case is a
+                // syntax error (no binding for `nonlocal` found) but ignore that here.
+                break use_def.declarations_at_binding(binding);
             }
         } else {
             use_def.declarations_at_binding(binding)
