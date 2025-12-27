@@ -10,7 +10,7 @@ use rustc_hash::FxHashSet;
 use crate::{
     Db,
     lint::LintId,
-    place::{DefinedPlace, Place},
+    place::{DefinedPlace, Place, place_from_declarations},
     semantic_index::{
         definition::DefinitionKind, place::ScopedPlaceId, place_table, scope::ScopeId,
         symbol::ScopedSymbolId, use_def_map,
@@ -20,10 +20,11 @@ use crate::{
         class::CodeGeneratorKind,
         context::InferContext,
         diagnostic::{
-            INVALID_EXPLICIT_OVERRIDE, INVALID_METHOD_OVERRIDE, INVALID_NAMED_TUPLE,
-            OVERRIDE_OF_FINAL_METHOD, report_invalid_method_override,
+            INVALID_ASSIGNMENT, INVALID_EXPLICIT_OVERRIDE, INVALID_METHOD_OVERRIDE,
+            INVALID_NAMED_TUPLE, OVERRIDE_OF_FINAL_METHOD, report_invalid_method_override,
             report_overridden_final_method,
         },
+        enums::{EnumMetadata, enum_metadata},
         function::{FunctionDecorators, FunctionType, KnownFunction},
         list_members::{Member, MemberWithDefinition, all_end_of_scope_members},
     },
@@ -45,6 +46,30 @@ const PROHIBITED_NAMEDTUPLE_ATTRS: &[&str] = &[
     "_source",
 ];
 
+struct EnumClassInfo<'db> {
+    metadata: &'db EnumMetadata<'db>,
+    value_sunder_type: Type<'db>,
+}
+
+impl<'db> EnumClassInfo<'db> {
+    fn from_class(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> Option<EnumClassInfo<'db>> {
+        let metadata = enum_metadata(db, class.into())?;
+
+        let scope = class.body_scope(db);
+        let value_sunder_symbol = place_table(db, scope).symbol_id("_value_")?;
+        let value_sunder_declarations =
+            use_def_map(db, scope).end_of_scope_symbol_declarations(value_sunder_symbol);
+        let value_sunder_type = place_from_declarations(db, value_sunder_declarations)
+            .ignore_conflicting_declarations()
+            .ignore_possibly_undefined()?;
+
+        Some(EnumClassInfo {
+            metadata,
+            value_sunder_type,
+        })
+    }
+}
+
 // TODO: Support dynamic class literals. If we allow dynamic classes to define attributes in their
 // namespace dictionary, we should also check whether those attributes are valid overrides of
 // attributes in their superclasses.
@@ -58,15 +83,24 @@ pub(super) fn check_class<'db>(context: &InferContext<'db, '_>, class: StaticCla
     let class_specialized = class.identity_specialization(db);
     let scope = class.body_scope(db);
     let own_class_members: FxHashSet<_> = all_end_of_scope_members(db, scope).collect();
+    let enum_info = EnumClassInfo::from_class(db, class);
 
     for member in own_class_members {
-        check_class_declaration(context, configuration, class_specialized, scope, &member);
+        check_class_declaration(
+            context,
+            configuration,
+            enum_info.as_ref(),
+            class_specialized,
+            scope,
+            &member,
+        );
     }
 }
 
 fn check_class_declaration<'db>(
     context: &InferContext<'db, '_>,
     configuration: OverrideRulesConfig,
+    enum_info: Option<&EnumClassInfo<'db>>,
     class: ClassType<'db>,
     class_scope: ScopeId<'db>,
     member: &MemberWithDefinition<'db>,
@@ -149,6 +183,44 @@ fn check_class_declaration<'db>(
             &member.name
         ));
         diagnostic.info("This will cause the class creation to fail at runtime");
+    }
+
+    // Check for invalid Enum member values.
+    //
+    // If we have enum information check that all enum members have
+    // values that are compatible with the `_value_` type.
+    if let Some(enum_info) = enum_info {
+        if member.name != "_value_"
+            && let DefinitionKind::Assignment(_) = first_reachable_definition.kind(db)
+        {
+            let member_value_type = member.ty;
+
+            let is_ellipsis = matches!(
+                member_value_type,
+                Type::NominalInstance(nominal_instance)
+                    if nominal_instance.has_known_class(db, KnownClass::EllipsisType)
+            );
+            let skip_type_check = context.in_stub() && is_ellipsis;
+
+            if !skip_type_check
+                && !member_value_type.is_assignable_to(db, enum_info.value_sunder_type)
+            {
+                if let Some(builder) = context.report_lint(
+                    &INVALID_ASSIGNMENT,
+                    first_reachable_definition.focus_range(db, context.module()),
+                ) {
+                    let mut diagnostic = builder.into_diagnostic(format_args!(
+                        "Enum member `{}` value is not compatible with `_value_` type",
+                        &member.name
+                    ));
+                    diagnostic.info(format_args!(
+                        "Expected type assignable to `{}`, got `{}`",
+                        enum_info.value_sunder_type.display(db),
+                        member_value_type.display(db)
+                    ));
+                }
+            }
+        }
     }
 
     let mut subclass_overrides_superclass_declaration = false;
