@@ -114,6 +114,20 @@ class Color(Enum):
     GREEN = "green"  # error: [invalid-assignment]
 ```
 
+Assigning to `self._value_` inside an enum `__init__` (which typically sets the per-member runtime `.value`) will produce an `invalid-assignment` diagnostic at the assignment site if the assigned type conflicts with the class-level `_value_` annotation:
+
+```py
+from enum import Enum
+
+class Planet2(Enum):
+    _value_: str
+
+    def __init__(self, value: int, mass: float, radius: float):
+        self._value_ = value  # error: [invalid-assignment]
+
+    MERCURY = (1, 3.303e23, 2.4397e6)
+```
+
 
 ### Non-member attributes with disallowed type
 

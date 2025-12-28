@@ -1060,6 +1060,61 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     if let Some(attr_ty) = declared_place.ignore_possibly_undefined() {
                         if let Some(metadata) = enums::enum_metadata(self.db(), class) {
+                            // Detect whether an instance `_value_` assignment exists in any method
+                            // (e.g., `def __init__(self, value): self._value_ = value`). If so, prefer
+                            // emitting diagnostics at the assignment site inside the method rather
+                            // than on the class-level member assignment (which holds the tuple
+                            // passed to `__init__`).
+                            use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+
+                            struct ValueAssignmentVisitor {
+                                found: bool,
+                            }
+
+                            impl<'a> Visitor<'a> for ValueAssignmentVisitor {
+                                fn visit_stmt(&mut self, stmt: &'a ast::Stmt) {
+                                    match stmt {
+                                        ast::Stmt::Assign(assign) => {
+                                            for target in &assign.targets {
+                                                if let Some(attr) = target.as_attribute_expr() {
+                                                    if let Some(base) = attr.value.as_name_expr() {
+                                                        if base.id.as_str() == "self"
+                                                            && attr.attr.as_str() == "_value_"
+                                                        {
+                                                            self.found = true;
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            walk_stmt(self, stmt);
+                                        }
+                                        _ => walk_stmt(self, stmt),
+                                    }
+                                }
+
+                                fn visit_expr(&mut self, expr: &'a ast::Expr) {
+                                    walk_expr(self, expr);
+                                }
+                            }
+
+                            let mut has_instance_value_assignment = false;
+                            for stmt in &class_node.body {
+                                if let ast::Stmt::FunctionDef(func) = stmt {
+                                    let mut visitor = ValueAssignmentVisitor { found: false };
+                                    for body_stmt in &func.body {
+                                        visitor.visit_stmt(body_stmt);
+                                        if visitor.found {
+                                            has_instance_value_assignment = true;
+                                            break;
+                                        }
+                                    }
+                                    if has_instance_value_assignment {
+                                        break;
+                                    }
+                                }
+                            }
+
                             for (member_name, member_ty) in &metadata.members {
                                 if let Some(member_symbol) = table.symbol_id(member_name.as_str()) {
                                     let bindings =
@@ -1070,14 +1125,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                                 definition.kind(self.db())
                                             {
                                                 let value = assign.value(self.module());
-                                                if !member_ty.is_assignable_to(self.db(), attr_ty) {
-                                                    report_invalid_attribute_assignment(
-                                                        &self.context,
-                                                        value.into(),
-                                                        attr_ty,
-                                                        *member_ty,
-                                                        member_name.as_str(),
-                                                    );
+                                                if !member_ty.is_assignable_to(self.db(), attr_ty)
+                                                {
+                                                    // If there's an instance-level `_value_` assignment,
+                                                    // prefer reporting the invalid assignment at that
+                                                    // site rather than on the class-level member.
+                                                    if !has_instance_value_assignment {
+                                                        report_invalid_attribute_assignment(
+                                                            &self.context,
+                                                            value.into(),
+                                                            attr_ty,
+                                                            *member_ty,
+                                                            member_name.as_str(),
+                                                        );
+                                                    }
                                                 }
                                             }
                                             break;
